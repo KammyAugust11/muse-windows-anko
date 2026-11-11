@@ -1,0 +1,31 @@
+[package]
+name = "muse-windows"
+version = "1.2.1"
+edition = "2021"
+description = "Muse for Windows - standalone Rust + WebView2 (WebUI) app, by Anko"
+license = "MIT"
+
+[[bin]]
+name = "anko"
+path = "src/main.rs"
+
+[dependencies]
+tao = "0.32"
+wry = "0.45"
+tray-icon = "0.20"
+image = { version = "0.25", default-features = false, features = ["png"] }
+open = "5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "6"
+url = "2"
+
+[build-dependencies]
+winres = "0.1"
+base64 = "0.22"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

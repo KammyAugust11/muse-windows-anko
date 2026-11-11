@@ -1,0 +1,281 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'">
+<title>MCP ツール</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f6f5f2; --panel: #ffffff; --line: #dcd9d2; --text: #22201c; --dim: #6f6a60;
+    --accent: #7a4a2b; --accent-text: #ffffff; --bad: #b3261e; --ok: #2e7d4f; --sel: #efe6dc;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1c1b19; --panel: #262422; --line: #3b3834; --text: #ece8e1; --dim: #a39d92;
+      --accent: #d9a57e; --accent-text: #1c1b19; --bad: #f2b8b5; --ok: #8fd3a8; --sel: #3a322b;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { display: flex; flex-direction: column; background: var(--bg); color: var(--text);
+         font: 13px/1.5 "Yu Gothic UI", "Segoe UI", sans-serif; }
+  header { display: flex; gap: 8px; align-items: center; padding: 8px 12px; border-bottom: 1px solid var(--line); }
+  header .path { flex: 1; min-width: 0; color: var(--dim); font-size: 12px; overflow: hidden;
+                 text-overflow: ellipsis; white-space: nowrap; }
+  main { flex: 1; min-height: 0; display: flex; }
+  nav { width: 250px; flex: none; overflow-y: auto; border-right: 1px solid var(--line); padding: 8px; }
+  section { flex: 1; min-width: 0; overflow-y: auto; padding: 14px 16px; }
+  button { font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--line);
+           border-radius: 6px; padding: 4px 12px; cursor: pointer; }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: .5; cursor: default; }
+  button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+  .server { margin-bottom: 12px; }
+  .server-head { display: flex; align-items: center; gap: 6px; font-weight: 600; }
+  .server-head .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--dim); flex: none; }
+  .dot.connected { background: var(--ok); } .dot.error { background: var(--bad); }
+  .dot.connecting { animation: blink 1s infinite; }
+  @keyframes blink { 50% { opacity: .25; } }
+  .note { color: var(--dim); font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .note.bad { color: var(--bad); }
+  .tool { display: block; width: 100%; text-align: left; border: 0; background: none; border-radius: 6px;
+          padding: 3px 8px 3px 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tool:hover { background: var(--sel); } .tool.selected { background: var(--sel); font-weight: 600; }
+  h1 { font-size: 16px; margin: 0 0 2px; overflow-wrap: anywhere; }
+  h2 { font-size: 12px; margin: 16px 0 4px; color: var(--dim); font-weight: 600; }
+  textarea, pre { width: 100%; margin: 0; padding: 8px; border: 1px solid var(--line); border-radius: 6px;
+                  background: var(--panel); color: var(--text); font: 12px/1.5 Consolas, "MS Gothic", monospace; }
+  textarea { min-height: 110px; resize: vertical; }
+  pre { white-space: pre-wrap; overflow-wrap: anywhere; min-height: 60px; max-height: 45vh; overflow-y: auto; }
+  pre.bad { border-color: var(--bad); }
+  table { border-collapse: collapse; width: 100%; font-size: 12px; }
+  td { border-top: 1px solid var(--line); padding: 3px 8px 3px 0; vertical-align: top; overflow-wrap: anywhere; }
+  td:first-child { font-family: Consolas, monospace; white-space: nowrap; }
+  .row { display: flex; gap: 8px; align-items: center; margin-top: 8px; flex-wrap: wrap; }
+  .status { color: var(--dim); font-size: 12px; }
+  code { font-family: Consolas, monospace; }
+</style>
+</head>
+<body>
+<header>
+  <span class="path" id="path"></span>
+  <button id="openConfig">設定ファイルを開く</button>
+  <button id="reload">再読み込み</button>
+</header>
+<main>
+  <nav id="servers"></nav>
+  <section id="detail"></section>
+</main>
+<script>
+(() => {
+  'use strict';
+  // Everything that comes from an MCP server (names, descriptions, results)
+  // is untrusted: it is only ever placed with textContent, never as HTML.
+  const $ = (id) => document.getElementById(id);
+  const el = (tag, props = {}, ...children) => {
+    const node = Object.assign(document.createElement(tag), props);
+    node.append(...children);
+    return node;
+  };
+
+  let nextId = 1;
+  const waiting = new Map();
+  const send = (msg) => new Promise((resolve, reject) => {
+    const id = nextId++;
+    waiting.set(id, { resolve, reject });
+    window.ipc.postMessage(JSON.stringify({ id, ...msg }));
+  });
+  window.__mcpReply = (reply) => {
+    const w = waiting.get(reply.id);
+    if (!w) return;
+    waiting.delete(reply.id);
+    reply.ok ? w.resolve(reply.data) : w.reject(new Error(reply.error));
+  };
+
+  const servers = new Map();   // name -> server snapshot
+  let selected = null;         // { server, tool }
+  const drafts = new Map();    // "server/tool" -> args text the user typed
+
+  const STATUS_LABEL = { connected: '接続済み', connecting: '接続中…', error: 'エラー', idle: '未接続', disabled: '無効' };
+
+  function skeleton(schema) {
+    const out = {};
+    const props = (schema && schema.properties) || {};
+    for (const name of (schema && schema.required) || []) {
+      const p = props[name] || {};
+      const type = Array.isArray(p.type) ? p.type[0] : p.type;
+      out[name] = p.default !== undefined ? p.default
+        : Array.isArray(p.enum) && p.enum.length ? p.enum[0]
+        : type === 'number' || type === 'integer' ? 0
+        : type === 'boolean' ? false
+        : type === 'array' ? []
+        : type === 'object' ? {}
+        : '';
+    }
+    return JSON.stringify(out, null, 2);
+  }
+
+  function renderServers() {
+    const nav = $('servers');
+    nav.replaceChildren();
+    if (!servers.size) {
+      nav.append(el('div', { className: 'note', textContent: 'サーバーが登録されていません。' }));
+      return;
+    }
+    for (const s of servers.values()) {
+      const box = el('div', { className: 'server' });
+      const head = el('div', { className: 'server-head' },
+        el('span', { className: 'dot ' + s.status, title: STATUS_LABEL[s.status] || s.status }),
+        el('span', { className: 'name', textContent: s.name, title: s.command }));
+      if (s.status === 'idle' || (s.status === 'error' && s.command)) {
+        head.append(el('button', { textContent: '接続', onclick: () => connect(s.name) }));
+      }
+      box.append(head);
+      if (s.status === 'connecting') box.append(el('div', { className: 'note', textContent: '起動しています…（初回は時間がかかることがあります）' }));
+      if (s.status === 'disabled') box.append(el('div', { className: 'note', textContent: 'disabled: true のため無効' }));
+      if (s.error) box.append(el('div', { className: 'note bad', textContent: s.error }));
+      if (s.status === 'connected' && !s.tools.length) box.append(el('div', { className: 'note', textContent: 'ツールがありません' }));
+      for (const t of s.tools || []) {
+        const isSel = selected && selected.server === s.name && selected.tool === t.name;
+        box.append(el('button', {
+          className: 'tool' + (isSel ? ' selected' : ''), textContent: t.name, title: t.description || '',
+          onclick: () => { selected = { server: s.name, tool: t.name }; renderServers(); renderDetail(); },
+        }));
+      }
+      nav.append(box);
+    }
+  }
+
+  function renderHelp() {
+    $('detail').replaceChildren(
+      el('h1', { textContent: 'MCP ツール' }),
+      el('p', { textContent: '手元の MCP サーバーのツールをここから実行し、結果を Muse の入力欄へ貼り付けられます。Muse 側（Web ページ）からツールが勝手に実行されることはありません。' }),
+      el('h2', { textContent: '設定のしかた' }),
+      el('p', { textContent: '「設定ファイルを開く」で mcp.json を開き、次の形でサーバーを登録して保存 →「再読み込み」。' }),
+      el('pre', { textContent: JSON.stringify({ mcpServers: { filesystem: { command: 'npx', args: ['-y', '@modelcontextprotocol/server-filesystem', 'C:\\Users\\you\\Documents'] } } }, null, 2) }),
+      el('p', { className: 'note', textContent: '対応しているのは command で起動する stdio サーバーです（URL 接続の HTTP サーバーは未対応）。ここに書いたコマンドは、あなたの権限でこの PC 上で実行されます。信頼できるサーバーだけ登録してください。' }));
+  }
+
+  function renderDetail() {
+    const s = selected && servers.get(selected.server);
+    const tool = s && (s.tools || []).find((t) => t.name === selected.tool);
+    if (!tool) { selected = null; renderHelp(); return; }
+    const key = s.name + '/' + tool.name;
+    const schema = tool.inputSchema || {};
+    const args = el('textarea', { spellcheck: false, value: drafts.has(key) ? drafts.get(key) : skeleton(schema) });
+    args.oninput = () => drafts.set(key, args.value);
+    const result = el('pre', { textContent: '' });
+    const status = el('span', { className: 'status' });
+    const run = el('button', { className: 'primary', textContent: '実行' });
+    const insert = el('button', { textContent: 'Muse の入力欄に貼り付け', disabled: true });
+    const copy = el('button', { textContent: 'コピー', disabled: true });
+
+    const params = el('table');
+    const required = new Set(schema.required || []);
+    for (const [name, p] of Object.entries(schema.properties || {})) {
+      const type = (Array.isArray(p.type) ? p.type.join(' | ') : p.type || '') + (required.has(name) ? '（必須）' : '');
+      params.append(el('tr', {}, el('td', { textContent: name }), el('td', { textContent: type }),
+        el('td', { textContent: p.description || '' })));
+    }
+
+    run.onclick = async () => {
+      let parsed;
+      try {
+        parsed = args.value.trim() ? JSON.parse(args.value) : {};
+        if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('オブジェクト { … } で指定してください');
+      } catch (e) {
+        result.className = 'bad'; result.textContent = '引数の JSON が正しくありません: ' + e.message; return;
+      }
+      run.disabled = true; insert.disabled = copy.disabled = true;
+      result.className = ''; result.textContent = ''; status.textContent = '実行中…';
+      const started = Date.now();
+      try {
+        const out = await send({ cmd: 'call', server: s.name, tool: tool.name, args: parsed });
+        result.className = out.isError ? 'bad' : '';
+        result.textContent = out.text || '（結果は空でした）';
+        status.textContent = (out.isError ? 'ツールがエラーを返しました' : '完了') + `（${((Date.now() - started) / 1000).toFixed(1)} 秒）`;
+        insert.disabled = copy.disabled = !out.text;
+      } catch (e) {
+        result.className = 'bad'; result.textContent = e.message; status.textContent = '失敗';
+        refresh();
+      } finally {
+        run.disabled = false;
+      }
+    };
+    copy.onclick = () => {
+      const range = document.createRange();
+      range.selectNodeContents(result);
+      const sel = getSelection();
+      sel.removeAllRanges(); sel.addRange(range);
+      status.textContent = document.execCommand('copy') ? 'コピーしました' : 'コピーできませんでした（Ctrl+C を使ってください）';
+    };
+    insert.onclick = async () => {
+      const text = `【MCP ツール ${s.name} / ${tool.name} の結果】\n${result.textContent}\n`;
+      try {
+        const done = await send({ cmd: 'insert', text });
+        status.textContent = done ? 'Muse の入力欄に貼り付けました（送信はしていません）'
+          : '入力欄が見つかりませんでした。「コピー」して貼り付けてください';
+      } catch (e) { status.textContent = e.message; }
+    };
+
+    $('detail').replaceChildren(
+      el('h1', { textContent: tool.title || tool.name }),
+      el('div', { className: 'note', textContent: s.name + ' / ' + tool.name }),
+      el('p', { textContent: tool.description || '', style: 'white-space: pre-wrap' }),
+      el('h2', { textContent: '引数（JSON）' }), args,
+      ...(params.childElementCount ? [el('h2', { textContent: 'パラメーター' }), params] : []),
+      el('div', { className: 'row' }, run, status),
+      el('h2', { textContent: '結果' }), result,
+      el('div', { className: 'row' }, insert, copy));
+  }
+
+  async function connect(name) {
+    const s = servers.get(name);
+    if (!s) return;
+    servers.set(name, { ...s, status: 'connecting', error: null, tools: [] });
+    renderServers();
+    try {
+      servers.set(name, await send({ cmd: 'connect', server: name }));
+    } catch (e) {
+      servers.set(name, { ...s, status: 'error', error: e.message, tools: [] });
+    }
+    renderServers();
+    if (selected && selected.server === name) renderDetail();
+  }
+
+  function apply(state) {
+    $('path').textContent = state.configPath;
+    $('path').title = state.configPath;
+    servers.clear();
+    for (const s of state.servers) servers.set(s.name, s);
+    renderServers();
+    renderDetail();
+    if (state.configError) {
+      $('servers').replaceChildren(el('div', { className: 'note bad', textContent: state.configError }));
+    }
+    return state;
+  }
+
+  // Sidebar-only refresh: keeps the detail pane (and its error text) intact.
+  const refresh = () => send({ cmd: 'state' }).then((state) => {
+    servers.clear();
+    for (const s of state.servers) servers.set(s.name, s);
+    renderServers();
+  }).catch(() => {});
+
+  async function load(cmd) {
+    const state = apply(await send({ cmd }));
+    // Start every server that is not running yet, in parallel.
+    for (const s of state.servers) if (s.status === 'idle') connect(s.name);
+  }
+
+  $('openConfig').onclick = () => send({ cmd: 'open_config' }).catch((e) => alert(e.message));
+  $('reload').onclick = () => { drafts.clear(); load('reload'); };
+  renderHelp();
+  load('state');
+})();
+</script>
+</body>
+</html>
